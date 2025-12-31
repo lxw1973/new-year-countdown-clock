@@ -1,7 +1,9 @@
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-跨年倒计时时钟程序（增加：播放声音 & 整点/半点报时）
+跨年倒计时时钟程序（增加：播放声音 & 整点/半点报时 & 烟花声音与视觉同步）
 """
 import tkinter as tk
 from tkinter import font
@@ -65,14 +67,19 @@ class NewYearCountdown:
         self.fireworks = []
 
         # 声音相关
-        # sound.wav 用于跨年祝贺（如果没有则不会播放）
-        # chime.wav 可用于报时（如果不存在则回退到 sound.wav）
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.sound_path = os.path.join(base_dir, "sound.mp3")
         self.chime_path = os.path.join(base_dir, "chime.mp3")
         if not os.path.isfile(self.chime_path):
             # 若没有单独的 chime.wav，则使用 sound.wav 作为报时音（如果存在）
             self.chime_path = self.sound_path
+
+        # 烟花音效文件（新）
+        self.firework_sound_path = os.path.join(base_dir, "firework.mp3")
+        # 播放状态与进程句柄
+        self.firework_audio_running = False
+        self.firework_proc = None
+
         self.sound_played = False  # 新年声音只播放一次
         # 记录上一次报时的时间 (year, month, day, hour, minute)，防止同一分钟内重复报时
         self.last_chime_time = None
@@ -83,9 +90,23 @@ class NewYearCountdown:
         self.canvas.bind('<B1-Motion>', self.on_move)
         self.canvas.bind('<Button-3>', self.show_context_menu)
 
+        # 在窗口关闭时确保停止音频
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        except Exception:
+            pass
+
         self.canvas.update_idletasks()
         self.create_ui()
         self.update_clock()
+
+    def _on_close(self):
+        # 退出时停止烟花音（如果在播放）
+        self.stop_firework_audio()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def start_move(self, event):
         self.start_x = event.x
@@ -98,7 +119,7 @@ class NewYearCountdown:
 
     def show_context_menu(self, event):
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="关闭窗口", command=self.root.quit)
+        menu.add_command(label="关闭窗口", command=self._on_close)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -229,7 +250,7 @@ class NewYearCountdown:
         t = threading.Thread(target=_worker, args=(path,), daemon=True)
         t.start()
 
-    def play_chime_sequence(self, path, count, interval=0.6):
+    def play_chime_sequence(self, path, count, interval=2):
         """在后台线程里连续播放 count 次指定音频，每次间隔 interval 秒。
         如果 count <=0 则不播放。"""
         if not path or not os.path.isfile(path) or count <= 0:
@@ -253,6 +274,98 @@ class NewYearCountdown:
 
         t = threading.Thread(target=_worker, args=(path, count, interval), daemon=True)
         t.start()
+
+    # ----------------- 新增：烟花音频同步控制 -----------------
+    def start_firework_audio(self):
+        """当烟花视觉开始时调用，启动后台循环播放音频（直到 stop_firework_audio 被调用或烟花结束）。"""
+        if self.firework_audio_running:
+            return
+        if not os.path.isfile(self.firework_sound_path):
+            return
+
+        self.firework_audio_running = True
+        t = threading.Thread(target=self._firework_audio_loop, daemon=True)
+        t.start()
+
+    def _firework_audio_loop(self):
+        """
+        循环播放音频直到 self.firework_audio_running 被设为 False。
+        优先尝试基于 subprocess 的播放器（可被 terminate），回退到 playsound（不可中途 terminate）。
+        """
+        path = self.firework_sound_path
+
+        # 可用播放器命令列表（优先级）
+        player_cmds = [
+            ["afplay", path],  # macOS
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+            ["mpg123", path],
+            ["mpv", "--no-video", path],
+            ["vlc", "--intf", "dummy", "--play-and-exit", path],
+        ]
+
+        # 检查可用命令（不实际启动），找到第一个可用的命令名（except playsound 回退）
+        available_cmd = None
+        for cmd in player_cmds:
+            try:
+                # 仅检查命令是否存在：尝试启动并立即 terminate (不播放) —— 为安全起见用 "which" 检查
+                if subprocess.call(["which", cmd[0]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                    available_cmd = cmd
+                    break
+            except Exception:
+                continue
+
+        if available_cmd is None:
+            # 回退到 playsound（线程内阻塞，无法 terminate；这是 best-effort）
+            try:
+                from playsound import playsound
+                while self.firework_audio_running:
+                    try:
+                        playsound(path)
+                    except Exception as e:
+                        print(f"playsound 播放失败: {e}")
+                        break
+                # 结束后清理标志
+            except Exception as e:
+                print(f"没有可用的外部播放器且 playsound 导入失败: {e}")
+            self.firework_audio_running = False
+            self.firework_proc = None
+            return
+
+        # 使用可被 terminate 的外部播放器循环播放
+        while self.firework_audio_running:
+            try:
+                # 启动播放器进程并等待结束或被 terminate
+                self.firework_proc = subprocess.Popen(available_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # 等待播放完成或被 terminate
+                self.firework_proc.wait()
+            except Exception as e:
+                # 出现问题则停止循环
+                print(f"播放烟花音效出错: {e}")
+                break
+            finally:
+                # 清理进程句柄
+                self.firework_proc = None
+            # 小短暂停，防止 tight loop
+            time.sleep(0.05)
+
+        # 退出循环并清理
+        self.firework_audio_running = False
+        self.firework_proc = None
+
+    def stop_firework_audio(self):
+        """停止正在播放的烟花音效（若使用外部播放器则 terminate 进程）。"""
+        self.firework_audio_running = False
+        if self.firework_proc:
+            try:
+                self.firework_proc.terminate()
+            except Exception:
+                try:
+                    self.firework_proc.kill()
+                except Exception:
+                    pass
+            self.firework_proc = None
+
+    # -------------------------------------------------------
 
     def update_clock(self):
         # 清除动态元素
@@ -291,7 +404,7 @@ class NewYearCountdown:
 
         # 时间与日期显示
         time_str = now.strftime("%H:%M:%S")
-        time_font = font.Font(family='Courier', size=max(int(32 * scale), 10), weight='bold')
+        time_font = font.Font(family='Courier', size=max(int(32 * scale), 36), weight='bold')
         # 阴影
         self.canvas.create_text(center_x + 2, canvas_height * 0.75 + 2,
                                 text=time_str, fill='#000000', font=time_font, tags="time_text")
@@ -299,7 +412,7 @@ class NewYearCountdown:
                                 text=time_str, fill='#00FF00', font=time_font, tags="time_text")
 
         date_str = now.strftime("%Y年%m月%d日")
-        date_font = font.Font(family='Arial', size=max(int(18 * scale), 8))
+        date_font = font.Font(family='Arial', size=max(int(18 * scale), 23))
         self.canvas.create_text(center_x + 2, canvas_height * 0.82 + 2,
                                 text=date_str, fill='#000000', font=date_font, tags="time_text")
         self.canvas.create_text(center_x, canvas_height * 0.82,
@@ -308,7 +421,7 @@ class NewYearCountdown:
         # 倒计时到新年
         current_year = now.year
         new_year = datetime(current_year + 1, 1, 1, 0, 0, 0)
-        # new_year = datetime(current_year, 12, 28, 13, 00, 0)  # 修改为新年钟声
+        # new_year = datetime(current_year, 12, 31, 9, 49, 0)  # 修改为新年钟声
         if now < new_year:
             delta = new_year - now
             days = delta.days
@@ -317,7 +430,7 @@ class NewYearCountdown:
             seconds = delta.seconds % 60
 
             countdown_str = f"距离{current_year + 1}年还有: {days}天 {hours:02d}时 {minutes:02d}分 {seconds:02d}秒"
-            countdown_font = font.Font(family='Arial', size=max(int(16 * scale), 8), weight='bold')
+            countdown_font = font.Font(family='Arial', size=max(int(16 * scale), 23), weight='bold')
             self.canvas.create_text(center_x + 2, canvas_height * 0.88 + 2,
                                     text=countdown_str, fill='#000000', font=countdown_font, tags="countdown")
             self.canvas.create_text(center_x, canvas_height * 0.88,
@@ -325,14 +438,20 @@ class NewYearCountdown:
 
             # 距离跨年不到1分钟，开始烟花效果
             if delta.total_seconds() < 60:
+                # 在 create_fireworks 内会判断是否从无到有并启动音频
                 self.create_fireworks(canvas_width, canvas_height)
         else:
-            celebration_str = f"🎉 新年快乐！{current_year}年 🎉"
+            # 当到达新年时：在表盘12点正下方居中显示祝福语
+            top_of_dial_y = center_y - radius
+            # 祝福语放在12点正下方，稍向下偏移一点
+            greeting_y = top_of_dial_y + 28 * scale
+            celebration_str = f"🎉Happy {current_year+1} 🎉"
             celebration_font = font.Font(family='Arial', size=max(int(20 * scale), 10), weight='bold')
-            self.canvas.create_text(center_x + 2, canvas_height * 0.88 + 2,
-                                    text=celebration_str, fill='#000000', font=celebration_font, tags="countdown")
-            self.canvas.create_text(center_x, canvas_height * 0.88,
-                                    text=celebration_str, fill='#FFD700', font=celebration_font, tags="countdown")
+
+            self.canvas.create_text(center_x + 2, greeting_y + 42,
+                                    text=celebration_str, fill='#EEAADD', font=celebration_font, tags="greeting")
+
+            # 在 create_fireworks 内会判断是否从无到有并启动音频
             self.create_fireworks(canvas_width, canvas_height)
 
             # 新年播放一次声音（只播放一次）
@@ -350,23 +469,26 @@ class NewYearCountdown:
                 if minute == 30:
                     # 半点：播放一次
                     if os.path.isfile(self.chime_path):
-                        self.play_chime_sequence(self.chime_path, 1, interval=0.4)
+                        self.play_chime_sequence(self.chime_path, 1, interval=1)
                 else:
                     # 整点：按12小时制播放报时次数（0点/12点播放12下）
                     hour_12 = now.hour % 12
                     count = hour_12 if hour_12 != 0 else 12
                     if os.path.isfile(self.chime_path):
                         # 间隔稍长一点以便分辨
-                        self.play_chime_sequence(self.chime_path, count, interval=0.6)
+                        self.play_chime_sequence(self.chime_path, count, interval=2)
                 self.last_chime_time = chime_time_tuple
 
-        # 更新烟花
+        # 更新烟花（update_fireworks 内会在烟花全部消失时停止音频）
         self.update_fireworks(scale)
 
         # 100ms 后再次更新
         self.root.after(100, self.update_clock)
 
     def create_fireworks(self, canvas_width, canvas_height):
+        # 如果当前没有烟花粒子，即将开始一次新的“烟花爆发”，则在添加后启动烟花音效
+        was_empty = (len(self.fireworks) == 0)
+
         if len(self.fireworks) < 50:
             for _ in range(3):
                 x = random.randint(int(canvas_width * 0.1), int(canvas_width * 0.9))
@@ -381,6 +503,10 @@ class NewYearCountdown:
                         'vy': speed * math.sin(math.radians(angle)),
                         'color': color, 'life': 30, 'size': random.randint(2, 4)
                     })
+
+        # 如果之前没有烟花而现在添加了烟花，则启动音效循环
+        if was_empty and len(self.fireworks) > 0 and os.path.isfile(self.firework_sound_path):
+            self.start_firework_audio()
 
     def update_fireworks(self, scale):
         canvas_width = self.canvas.winfo_width()
@@ -398,6 +524,10 @@ class NewYearCountdown:
                                         fill=fw['color'], outline=fw['color'], tags="firework")
                 new_fireworks.append(fw)
         self.fireworks = new_fireworks
+
+        # 如果烟花全部结束，立即停止音效（以同步音效时长）
+        if len(self.fireworks) == 0:
+            self.stop_firework_audio()
 
 
 def main():
